@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -40,6 +41,7 @@ MAX_TOTAL_SIZE = 8 * 1024 * 1024
 _DIGEST_PREFIX = "sha256:"
 _INDEX_VERSION = 1
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SESSION_RE = re.compile(r"^[A-Za-z0-9]{1,32}$")
 
 
 def _is_sha256_hex(value: str) -> bool:
@@ -141,6 +143,92 @@ class UploadStore:
         # A paused repair persists its plan and resumes on the next request
         # or after a restart.
         self.repair_block_limit: Optional[int] = None
+        # On startup (i.e. a service restart over the same persistent volume)
+        # every repair interrupted mid-flight is driven to completion from its
+        # persisted plan and fsynced restore copy, without the client having to
+        # re-upload the original or call repair again.
+        self._resume_pending_repairs()
+
+    # ---- startup recovery ------------------------------------------------
+
+    def _resume_pending_repairs(self) -> None:
+        """Finish repairs left over from an interrupted previous process.
+
+        Each persisted ``repair/state.json`` plus its validated
+        ``repair/restore.tmp`` is everything needed to continue; sessions are
+        resumed one by one so a problem with one never blocks the others.
+        """
+        try:
+            sessions = sorted(os.listdir(self.root))
+        except OSError:
+            return
+        for session in sessions:
+            if not _SESSION_RE.match(session):
+                continue
+            if not os.path.isfile(self._repair_state_path(session)):
+                continue
+            try:
+                self._resume_session_repair(session)
+            except Exception:  # noqa: BLE001 - startup must never crash the service
+                logging.getLogger(__name__).exception(
+                    "auto-resume of interrupted repair failed for session %r",
+                    session,
+                )
+
+    def _resume_session_repair(self, session: str) -> None:
+        with self._lock:
+            meta = self.get_metadata(session)
+            if meta is None:
+                return
+            receipt = self._read_receipt(session)
+            if receipt is None:
+                # Repair is sealed-only; an unsealed/unknown dir never has a
+                # legitimate plan, so drop stale state.
+                shutil.rmtree(self._repair_dir(session), ignore_errors=True)
+                return
+            state = self._read_repair_state(session, meta)
+            if state is None:
+                # Plan missing or incompatible with the pinned metadata.
+                shutil.rmtree(self._repair_dir(session), ignore_errors=True)
+                return
+            if self._try_complete_repair(session, meta, receipt, state):
+                return
+            try:
+                with open(self._restore_path(session), "rb") as fh:
+                    original = fh.read()
+            except (FileNotFoundError, OSError):
+                # The validated original is gone: nothing can drive the
+                # remaining blocks. Keep the plan so the next explicit repair
+                # call (with the original re-uploaded) resumes normally.
+                logging.getLogger(__name__).warning(
+                    "cannot auto-resume repair for %r: restore copy missing",
+                    session,
+                )
+                return
+            if len(original) != meta.total_size:
+                return
+            if hashlib.sha256(original).hexdigest() != meta.sha256:
+                # The persisted copy no longer matches the receipt anchor;
+                # refuse to use it and wait for a fresh explicit repair.
+                logging.getLogger(__name__).warning(
+                    "cannot auto-resume repair for %r: restore copy failed "
+                    "receipt verification",
+                    session,
+                )
+                return
+            # Same convergence path as an explicit repair call, but sourced
+            # entirely from persisted data; the test-only block limit never
+            # applies here so startup always drives the plan to completion.
+            # Refresh the plan first, so damage that appeared while the
+            # service was down (in a block the old plan considered fine) is
+            # picked up and fixed in the same startup pass.
+            categories, bad = self._plan_repair(session, meta, original)
+            if bad:
+                state["bad"] = sorted(set(state["bad"]) | bad)
+                for key in ("missing", "bad_length", "digest_mismatch"):
+                    state[key] = sorted(set(state[key]) | categories[key])
+                self._write_repair_state(session, state)
+            self._continue_repair(session, meta, receipt, state, original)
 
     # ---- paths -----------------------------------------------------------
 
@@ -747,7 +835,6 @@ class UploadStore:
             receipt = self._read_receipt(session)
             if receipt is None:
                 raise ConflictError("session is not sealed; repair is sealed-only")
-            receipt_before = json.dumps(receipt, sort_keys=True)
 
             # The uploaded file is accepted only when it IS the receipted
             # original: exact length and exact whole-file digest. A wrong file
@@ -833,95 +920,119 @@ class UploadStore:
                     for key in ("missing", "bad_length", "digest_mismatch"):
                         state[key] = sorted(set(state[key]) | categories[key])
 
-            replaced_this_call = 0
-            # The fresh plan drives the work: even a block an earlier call had
-            # marked "repaired" is replaced again if it is bad once more.
-            for i in sorted(bad):
-                offset = i * CHUNK_SIZE
-                expected = data[offset : offset + self._expected_chunk_size(meta, offset)]
-                try:
-                    with open(self._chunk_path(session, i), "rb") as fh:
-                        current = fh.read()
-                except (FileNotFoundError, OSError):
-                    current = None
-                if current != expected:
-                    _atomic_write(self._chunk_path(session, i), expected)
-                    replaced_this_call += 1
-                state["repaired"] = sorted(set(state["repaired"]) | {i})
-                # Progress is persisted after EVERY block, so an interruption
-                # at any point resumes instead of restarting.
-                self._write_repair_state(session, state)
-                # Test-only limit pauses the request; whether paused or not,
-                # convergence below is decided by re-scanning the blocks.
-                if (
-                    self.repair_block_limit is not None
-                    and replaced_this_call >= self.repair_block_limit
-                ):
-                    break
+            return self._continue_repair(session, meta, receipt, state, data)
 
-            # Re-scan against the validated original. Any block still bad
-            # (including one that rotted again after an earlier replacement)
-            # remains in the persisted plan, so the next call always makes
-            # progress and eventually converges.
-            categories_now, bad_now = self._plan_repair(session, meta, data)
+    def _continue_repair(
+        self,
+        session: str,
+        meta: Metadata,
+        receipt: dict,
+        state: dict,
+        data: bytes,
+    ) -> dict:
+        """Drive a persisted repair plan toward convergence.
 
-            if bad_now:
-                state["bad"] = sorted(set(state["bad"]) | bad_now)
-                self._write_repair_state(session, state)
-                recovered = set(state["bad"]) - bad_now
-                return self._audit_response(
-                    session,
-                    meta,
-                    receipt,
-                    "REPAIRING",
-                    index_present=index is not None,
-                    index_built=False,
-                    missing=categories_now["missing"],
-                    bad_length=categories_now["bad_length"],
-                    digest_mismatch=categories_now["digest_mismatch"],
-                    # The repair plan is derived from the validated original,
-                    # so every remaining block is precisely located.
-                    mismatch_located=True,
-                    remaining=bad_now,
-                    repaired=recovered,
-                )
+        ``data`` is the receipt-verified original (either freshly uploaded or
+        re-read from the persisted ``restore.tmp`` after a restart). Replaces
+        every still-bad planned block, persisting progress after each one, and
+        either reports REPAIRING (when the test-only block limit paused this
+        run or blocks remain) or finalizes: verifies the whole-file digest
+        against the receipt, reconciles the trusted index and clears the
+        repair directory. Already-restored blocks are never rewritten.
+        """
+        index = self._read_index(session, meta)
+        replaced_this_call = 0
+        # The fresh plan drives the work: even a block an earlier call had
+        # marked "repaired" is replaced again if it is bad once more.
+        for i in sorted(state["bad"]):
+            offset = i * CHUNK_SIZE
+            expected = data[offset : offset + self._expected_chunk_size(meta, offset)]
+            try:
+                with open(self._chunk_path(session, i), "rb") as fh:
+                    current = fh.read()
+            except (FileNotFoundError, OSError):
+                current = None
+            if current != expected:
+                _atomic_write(self._chunk_path(session, i), expected)
+                replaced_this_call += 1
+            state["repaired"] = sorted(set(state["repaired"]) | {i})
+            # Progress is persisted after EVERY block, so an interruption
+            # at any point resumes instead of restarting.
+            self._write_repair_state(session, state)
+            # Test-only limit pauses the request; whether paused or not,
+            # convergence below is decided by re-scanning the blocks. Startup
+            # auto-resume runs with the limit unset, so it always completes.
+            if (
+                self.repair_block_limit is not None
+                and replaced_this_call >= self.repair_block_limit
+            ):
+                break
 
-            # All blocks match the validated original. Nothing is committed
-            if self._whole_file_digest(session, meta) != meta.sha256:
-                raise ConflictError(
-                    "repair did not converge: whole-file digest still mismatched"
-                )
+        # Re-scan against the validated original. Any block still bad
+        # (including one that rotted again after an earlier replacement)
+        # remains in the persisted plan, so the next run always makes
+        # progress and eventually converges.
+        categories_now, bad_now = self._plan_repair(session, meta, data)
 
-            # Reconcile the per-chunk index with the restored bytes. This both
-            # builds it for old sessions (index was absent) and repairs a
-            # forged/stale index: the receipted digest, not the old index, is
-            # the root of trust.
-            entries = self._index_entries_from_chunks(session, meta)
-            if entries is None:
-                raise ConflictError("repair did not converge: index build failed")
-            index_built = index is None or entries != index
-            self._write_index(session, meta, entries)
-
-            # The receipt (including sealed_at) must be byte-stable throughout.
-            after = self._read_receipt(session)
-            if after is None or json.dumps(after, sort_keys=True) != receipt_before:
-                raise ConflictError("internal error: receipt changed during repair")
-
-            shutil.rmtree(self._repair_dir(session), ignore_errors=True)
+        if bad_now:
+            state["bad"] = sorted(set(state["bad"]) | bad_now)
+            self._write_repair_state(session, state)
+            recovered = set(state["bad"]) - bad_now
             return self._audit_response(
                 session,
                 meta,
-                after,
-                "HEALTHY",
-                index_present=True,
-                index_built=index_built,
-                # The repaired blocks are reported as recovered on this call.
-                missing=set(),
-                bad_length=set(),
-                digest_mismatch=set(),
+                receipt,
+                "REPAIRING",
+                index_present=index is not None,
+                index_built=False,
+                missing=categories_now["missing"],
+                bad_length=categories_now["bad_length"],
+                digest_mismatch=categories_now["digest_mismatch"],
+                # The repair plan is derived from the validated original,
+                # so every remaining block is precisely located.
                 mismatch_located=True,
-                repaired=set(state["bad"]),
+                remaining=bad_now,
+                repaired=recovered,
             )
+
+        # All blocks match the validated original. Nothing is committed
+        if self._whole_file_digest(session, meta) != meta.sha256:
+            raise ConflictError(
+                "repair did not converge: whole-file digest still mismatched"
+            )
+
+        # Reconcile the per-chunk index with the restored bytes. This both
+        # builds it for old sessions (index was absent) and repairs a
+        # forged/stale index: the receipted digest, not the old index, is
+        # the root of trust.
+        entries = self._index_entries_from_chunks(session, meta)
+        if entries is None:
+            raise ConflictError("repair did not converge: index build failed")
+        index_built = index is None or entries != index
+        self._write_index(session, meta, entries)
+
+        # The receipt (including sealed_at) must be byte-stable throughout.
+        after = self._read_receipt(session)
+        if after is None or json.dumps(after, sort_keys=True) != json.dumps(
+            receipt, sort_keys=True
+        ):
+            raise ConflictError("internal error: receipt changed during repair")
+
+        shutil.rmtree(self._repair_dir(session), ignore_errors=True)
+        return self._audit_response(
+            session,
+            meta,
+            after,
+            "HEALTHY",
+            index_present=True,
+            index_built=index_built,
+            # The repaired blocks are reported as recovered on this call.
+            missing=set(),
+            bad_length=set(),
+            digest_mismatch=set(),
+            mismatch_located=True,
+            repaired=set(state["bad"]),
+        )
 
     def _reconcile_index(
         self, session: str, meta: Metadata, index: Optional[list[dict]]
