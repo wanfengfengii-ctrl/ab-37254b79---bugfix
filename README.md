@@ -45,7 +45,9 @@ TypeScript/React 前端 + FastAPI 后端的全栈封存台。上传中断（断�
     标明是否可定位到具体块；旧会话无索引时只能发现整文件摘要不符，置
     `unlocated_digest_mismatch: true`（**无法定位的摘要不符**）。
 - `bad_ranges` 为三类异常的并集；`receipt` 始终回传当前（不变的）回执。
-- 修复进行中复核返回 `REPAIRING`、`remaining_ranges` 与 `recovered_ranges`，结果稳定且只读。
+- 修复进行中复核返回 `REPAIRING`、`remaining_ranges` 与 `recovered_ranges`，结果稳定且只读；
+  但若复核时发现修复计划是**上一个进程**中断遗留的（服务重启后），复核会用已持久化、已校验的
+  `restore.tmp` **自动续作到收敛**并直接返回 `HEALTHY`，无需客户端重新上传或再次调用修复。
 
 ### 原文件修复 `repair`
 

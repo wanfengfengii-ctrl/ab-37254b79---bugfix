@@ -14,6 +14,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -23,9 +26,9 @@ DATA = os.environ.get("DATA_DIR", "/data")
 CHUNK = 65536
 
 
-def call(method: str, path: str, body: bytes | None = None, headers=None):
+def call(method: str, path: str, body: bytes | None = None, headers=None, base=BASE):
     req = urllib.request.Request(
-        BASE + path,
+        base + path,
         data=body,
         method=method,
         headers=headers or {},
@@ -105,18 +108,50 @@ def write_repair_plan(session, blob, bad, repaired=None, categories=None):
         json.dump(plan, fh)
 
 
-def wait_healthy(timeout=30.0):
+def wait_healthy(timeout=30.0, base=BASE):
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
         try:
-            status, _ = call("GET", "/health")
+            status, _ = call("GET", "/health", base=base)
             if status == 200:
                 return
         except Exception as exc:  # connection refused while starting
             last = exc
         time.sleep(0.5)
     raise SystemExit(f"service never became healthy: {last}")
+
+
+def backend_dir():
+    for candidate in (
+        os.environ.get("SMOKE_BACKEND_DIR"),
+        "/app/backend",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"),
+    ):
+        if candidate and os.path.isfile(os.path.join(candidate, "app", "main.py")):
+            return os.path.abspath(candidate)
+    return None
+
+
+def spawn_server(data_dir, port):
+    """Start a real server PROCESS over data_dir (a genuine restart)."""
+    env = dict(os.environ)
+    env["DATA_DIR"] = data_dir
+    env["STATIC_DIR"] = tempfile.mkdtemp(prefix="smoke-static-")
+    log = open(os.path.join(tempfile.gettempdir(), f"smoke-uvicorn-{port}.log"), "wb")
+    proc = subprocess.Popen(
+        [
+            sys.executable, "-m", "uvicorn", "app.main:app",
+            "--host", "127.0.0.1", "--port", str(port),
+        ],
+        cwd=backend_dir(),
+        env=env,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
+    base = f"http://127.0.0.1:{port}"
+    wait_healthy(base=base)
+    return proc, base
 
 
 def check(cond, label):
@@ -350,7 +385,149 @@ def main():
     status, body = call("POST", f"/api/uploads/{sd}/audit")
     check(body["status"] == "HEALTHY", "final audit after resume is HEALTHY")
 
-    print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb}, {sa}, {sbx}, {sc}, {sd})")
+    print("[restart auto-resume: audit alone finishes an interrupted repair]")
+    restart_case = _restart_auto_resume_case(s)
+
+    print(f"\nSMOKE OK against {BASE} (sessions {s}, {sb}, {sa}, {sbx}, {sc}, {sd}, {restart_case})")
+
+
+def _free_port():
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+
+
+def _restart_auto_resume_case(suffix):
+    """The acceptance scenario, exercised over a real process restart:
+
+    >=2 anomalous blocks, the first already repaired and all resume data
+    persisted, then the process dies. A fresh server over the same volume is
+    audited only (no re-upload, no /repair) and must converge to HEALTHY with
+    the anomaly ranges cleared and the receipt / sealed_at byte-identical.
+    """
+    if backend_dir() is None:
+        print("[skip] backend sources not found for a restarted server")
+        return "SKIPPED"
+
+    work = tempfile.mkdtemp(prefix="smoke-restart-")
+    port = _free_port()
+    proc, base = spawn_server(work, port)
+    session = suffix + "R"
+    try:
+        blob = os.urandom(4 * CHUNK + 1)  # 5 chunks
+        digest, receipt = upload_and_seal_to(base, session, blob)
+        sealed_at = receipt["sealed_at"]
+
+        # two anomalous blocks: 1 and 3
+        flip_file(chunk_path_in(work, session, 1))
+        flip_file(chunk_path_in(work, session, 3), at=9)
+        status, body = call("POST", f"/api/uploads/{session}/audit", base=base)
+        check(body["status"] == "DEGRADED", "restart case: corruption detected")
+        check(body["bad_ranges"] == [[1, 1], [3, 3]],
+              f"restart case: two bad blocks reported: {body}")
+
+        # repair replaces the FIRST bad block, then the process is interrupted;
+        # the resume data (plan + validated original) is durable on disk.
+        with open(chunk_path_in(work, session, 1), "wb") as fh:
+            fh.write(blob[CHUNK:2 * CHUNK])
+        repair_dir = os.path.join(work, session, "repair")
+        os.makedirs(repair_dir, exist_ok=True)
+        with open(os.path.join(repair_dir, "restore.tmp"), "wb") as fh:
+            fh.write(blob)
+        with open(os.path.join(repair_dir, "state.json"), "w") as fh:
+            json.dump({
+                "total_size": len(blob),
+                "sha256": digest,
+                "bad": [1, 3],
+                "repaired": [1],
+                "missing": [],
+                "bad_length": [],
+                "digest_mismatch": [1, 3],
+            }, fh)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=20)
+
+    # restart with the SAME persistent volume; only an audit is performed
+    proc, base = spawn_server(work, port)
+    try:
+        status, body = call("POST", f"/api/uploads/{session}/audit", base=base)
+        check(status == 200 and body["status"] == "HEALTHY",
+              f"audit after restart auto-resumes to HEALTHY: {body}")
+        check(body["bad_ranges"] == [] and body["remaining_ranges"] == [],
+              "restart case: anomaly ranges are empty")
+        check(body["repaired_ranges"] == [[1, 1], [3, 3]],
+              f"restart case: recovered ranges reported: {body}")
+        check(body["receipt"] == receipt
+              and body["receipt"]["sealed_at"] == sealed_at,
+              "restart case: receipt and sealed_at unchanged")
+
+        reassembled = b"".join(
+            open(chunk_path_in(work, session, i), "rb").read()
+            for i in range(5)
+        )
+        check(reassembled == blob and hashlib.sha256(reassembled).hexdigest() == digest,
+              "restart case: sealed content is whole again")
+        check(not os.path.isdir(repair_dir),
+              "restart case: repair workspace removed after convergence")
+
+        # repeated audits stay stable HEALTHY with cleared ranges; the normal
+        # scan no longer carries the one-shot recovered list (as elsewhere)
+        again_status, again = call("POST", f"/api/uploads/{session}/audit", base=base)
+        check(
+            again_status == 200
+            and again["status"] == "HEALTHY"
+            and again["bad_ranges"] == []
+            and again["remaining_ranges"] == []
+            and again["recovered_ranges"] == []
+            and again["receipt"] == receipt,
+            "restart case: repeated audit is stable HEALTHY",
+        )
+    finally:
+        proc.terminate()
+        proc.wait(timeout=20)
+
+    proc, base = spawn_server(work, port)
+    try:
+        status, body = call("POST", f"/api/uploads/{session}/audit", base=base)
+        check(body["status"] == "HEALTHY" and not os.path.isdir(repair_dir),
+              "restart case: another restart stays HEALTHY, no stale repair dir")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=20)
+    return session
+
+
+def chunk_path_in(data_dir, session, index):
+    return os.path.join(data_dir, session, "chunks", f"{index:08d}")
+
+
+def upload_and_seal_to(base, session, blob):
+    digest = hashlib.sha256(blob).hexdigest()
+    total = len(blob)
+    count = (total + CHUNK - 1) // CHUNK
+    for i in range(count):
+        off = i * CHUNK
+        part = blob[off : min(off + CHUNK, total)]
+        headers = {
+            "X-Chunk-Offset": str(off),
+            "X-Total-Size": str(total),
+            "X-Content-SHA256": digest,
+            "Content-Type": "application/octet-stream",
+        }
+        req = urllib.request.Request(
+            base + f"/api/uploads/{session}/chunks",
+            data=part, method="PUT", headers=headers,
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if resp.status != 200:
+                raise SystemExit(f"restart case upload failed: {resp.status}")
+    status, receipt = call("POST", f"/api/uploads/{session}/seal", base=base)
+    if status != 200:
+        raise SystemExit(f"restart case seal failed: {status} {receipt}")
+    return digest, receipt
 
 
 if __name__ == "__main__":

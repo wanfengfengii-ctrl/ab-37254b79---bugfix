@@ -645,6 +645,206 @@ def test_completed_repair_state_after_restart_autofinalizes_on_audit(client, tmp
     assert body["receipt"] == receipt
 
 
+# ---------------------------------------------------------------------------
+# automatic resume after a service restart (audit-only, no re-upload)
+# ---------------------------------------------------------------------------
+
+
+def _interrupted_repair_on_disk(tmp_path, session, blob, done, bad_indices):
+    """Build a realistic "crashed mid-repair" state entirely on disk:
+
+    the first ``done`` bad blocks already hold the correct bytes, the other
+    bad blocks stay corrupt, and repair/{state.json,restore.tmp} persisted as
+    the real repair path writes them.
+    """
+    repair_dir = _session_dir(tmp_path, session) / "repair"
+    repair_dir.mkdir(parents=True, exist_ok=True)
+    (repair_dir / "restore.tmp").write_bytes(blob)
+    state = {
+        "total_size": len(blob),
+        "sha256": _digest(blob),
+        "bad": sorted(bad_indices),
+        "repaired": sorted(bad_indices[:done]),
+        "missing": [],
+        "bad_length": [],
+        "digest_mismatch": sorted(bad_indices),
+    }
+    (repair_dir / "state.json").write_text(json.dumps(state))
+
+
+def test_audit_after_restart_auto_resumes_without_reupload(client, tmp_path):
+    data_dir = tmp_path / "data"
+    # at least three chunks, two bad; acceptance uses >=2 bad blocks
+    blob = os.urandom(5 * CHUNK_SIZE + 1)
+    sha, receipt = _make_sealed(client, tmp_path, "rs", blob)
+    _flip(_chunk_file(tmp_path, "rs", 1))
+    _flip(_chunk_file(tmp_path, "rs", 3), at=7)
+    sealed_at = receipt["sealed_at"]
+
+    # operator repairs with the complete original; the first bad block is
+    # replaced and progress + restore data are persisted...
+    web.store.repair_block_limit = 1
+    first = client.post("/api/uploads/rs/repair", content=blob).json()
+    assert first["status"] == "REPAIRING"
+    assert first["recovered_ranges"] == [[1, 1]]
+    assert first["remaining_ranges"] == [[3, 3]]
+    assert _repair_state_file(tmp_path, "rs").exists()
+    # ...then the process dies mid-repair.
+
+    # restart over the SAME volume; operator neither re-uploads nor calls
+    # /repair -- a single integrity audit must converge the repair
+    web.store = UploadStore(str(data_dir))
+    body = client.post("/api/uploads/rs/audit").json()
+    assert body["status"] == "HEALTHY", body
+    assert body["bad_ranges"] == []
+    assert body["remaining_ranges"] == []
+    assert body["repaired_ranges"] == [[1, 1], [3, 3]]
+    assert body["receipt"] == receipt
+    assert body["receipt"]["sealed_at"] == sealed_at
+
+    # content is whole again, the repair workspace is gone, audit stays clean
+    reassembled = b"".join(
+        _chunk_file(tmp_path, "rs", i).read_bytes() for i in range(6)
+    )
+    assert reassembled == blob
+    assert _digest(reassembled) == sha
+    assert not (data_dir / "rs" / "repair").exists()
+    again = client.post("/api/uploads/rs/audit").json()
+    assert again["status"] == "HEALTHY"
+    assert again["remaining_ranges"] == []
+    assert again["receipt"]["sealed_at"] == sealed_at
+
+
+def test_restart_auto_resume_does_not_rewrite_completed_blocks(client, tmp_path):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(4 * CHUNK_SIZE + 1)
+    _, receipt = _make_sealed(client, tmp_path, "rw", blob)
+    _flip(_chunk_file(tmp_path, "rw", 0))
+    _flip(_chunk_file(tmp_path, "rw", 2), at=3)
+
+    # block 0 already replaced; capture the good on-disk bytes + mtime
+    web.store.repair_block_limit = 1
+    client.post("/api/uploads/rw/repair", content=blob)
+    done_path = _chunk_file(tmp_path, "rw", 0)
+    done_bytes = done_path.read_bytes()
+    done_mtime = done_path.stat().st_mtime_ns
+
+    web.store = UploadStore(str(data_dir))  # restart
+    body = client.post("/api/uploads/rw/audit").json()
+    assert body["status"] == "HEALTHY"
+
+    # the already-completed block must not have been rewritten
+    assert done_path.read_bytes() == done_bytes
+    assert done_path.stat().st_mtime_ns == done_mtime
+    # the still-bad block is restored
+    assert _chunk_file(tmp_path, "rw", 2).read_bytes() == blob[
+        2 * CHUNK_SIZE : 3 * CHUNK_SIZE
+    ]
+    assert body["receipt"] == receipt
+
+
+def test_restart_auto_resume_survives_another_restart(client, tmp_path):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(5 * CHUNK_SIZE + 1)
+    _, receipt = _make_sealed(client, tmp_path, "rx", blob)
+    _corrupt_many(tmp_path, "rx", [0, 2, 4], 6)
+
+    # first request replaces block 0, then the process dies
+    web.store.repair_block_limit = 1
+    client.post("/api/uploads/rx/repair", content=blob)
+
+    # restart: the auto-resume audit is itself interrupted after one block
+    web.store = UploadStore(str(data_dir))
+    web.store.repair_block_limit = 1
+    a1 = client.post("/api/uploads/rx/audit").json()
+    assert a1["status"] == "REPAIRING"
+    assert a1["remaining_ranges"] == [[4, 4]]
+    assert a1["recovered_ranges"] == [[0, 0], [2, 2]]
+
+    # restart AGAIN during the resumed work; audit-only must still converge
+    web.store = UploadStore(str(data_dir))
+    body = client.post("/api/uploads/rx/audit").json()
+    assert body["status"] == "HEALTHY"
+    assert body["remaining_ranges"] == []
+    assert body["repaired_ranges"] == [[0, 0], [2, 2], [4, 4]]
+    assert body["receipt"] == receipt
+    assert b"".join(
+        _chunk_file(tmp_path, "rx", i).read_bytes() for i in range(6)
+    ) == blob
+
+
+def test_restart_resume_picks_up_new_rot_after_crash(client, tmp_path):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(4 * CHUNK_SIZE + 1)
+    _, receipt = _make_sealed(client, tmp_path, "rz", blob)
+    _flip(_chunk_file(tmp_path, "rz", 0))
+    _flip(_chunk_file(tmp_path, "rz", 3))
+
+    web.store.repair_block_limit = 1
+    client.post("/api/uploads/rz/repair", content=blob)  # fixes block 0
+
+    # block 2 rots silently while the service is down
+    _flip(_chunk_file(tmp_path, "rz", 2))
+
+    web.store = UploadStore(str(data_dir))
+    body = client.post("/api/uploads/rz/audit").json()
+    assert body["status"] == "HEALTHY"
+    assert body["repaired_ranges"] == [[0, 0], [2, 3]]
+    assert body["receipt"] == receipt
+
+
+def test_restart_without_restore_copy_stays_repairing_and_reupload_works(
+    client, tmp_path
+):
+    data_dir = tmp_path / "data"
+    blob = os.urandom(3 * CHUNK_SIZE + 1)
+    _, receipt = _make_sealed(client, tmp_path, "rc2", blob)
+    _flip(_chunk_file(tmp_path, "rc2", 0))
+    _flip(_chunk_file(tmp_path, "rc2", 2))
+    _interrupted_repair_on_disk(
+        tmp_path, "rc2", blob, done=0, bad_indices=[0, 2]
+    )
+    # crash between the plan write and the validated copy fsync: no restore.tmp
+    (_session_dir(tmp_path, "rc2") / "repair" / "restore.tmp").unlink()
+
+    web.store = UploadStore(str(data_dir))  # restart
+    body = client.post("/api/uploads/rc2/audit").json()
+    # without the persisted original it cannot auto-repair; it must not fake
+    # HEALTHY and must keep the plan for a client re-upload
+    assert body["status"] == "REPAIRING"
+    assert body["remaining_ranges"] == [[0, 0], [2, 2]]
+    assert _repair_state_file(tmp_path, "rc2").exists()
+
+    # a re-upload still converges normally
+    done = client.post("/api/uploads/rc2/repair", content=blob).json()
+    assert done["status"] == "HEALTHY"
+    assert done["repaired_ranges"] == [[0, 0], [2, 2]]
+    assert done["receipt"] == receipt
+
+
+def test_same_process_paused_repair_audit_stays_read_only(client, tmp_path):
+    blob = os.urandom(4 * CHUNK_SIZE + 1)
+    _, receipt = _make_sealed(client, tmp_path, "sp", blob)
+    _corrupt_many(tmp_path, "sp", [0, 2], 4)
+
+    web.store.repair_block_limit = 1
+    paused = client.post("/api/uploads/sp/repair", content=blob).json()
+    assert paused["status"] == "REPAIRING"
+    # within the SAME process an audit is the stable read-only poll, it does
+    # not drive the repair (only a restart re-arms automatic resumption)
+    a1 = client.post("/api/uploads/sp/audit").json()
+    a2 = client.post("/api/uploads/sp/audit").json()
+    assert a1 == a2
+    assert a1["status"] == "REPAIRING"
+    assert a1["remaining_ranges"] == [[2, 2]]
+    assert _repair_state_file(tmp_path, "sp").exists()
+
+    web.store.repair_block_limit = None
+    done = client.post("/api/uploads/sp/repair", content=blob).json()
+    assert done["status"] == "HEALTHY"
+    assert done["receipt"] == receipt
+
+
 def test_single_byte_file_audit_and_repair_roundtrip(client, tmp_path):
     blob = b"z"
     _, receipt = _make_sealed(client, tmp_path, "one", blob)
